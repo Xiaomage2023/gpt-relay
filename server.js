@@ -1,22 +1,22 @@
-// GPT 号池出口中转（alwaysdata 搬家版，逻辑与 Render 现网版完全一致）
-// 职责单一：接收站点引擎（Cloudflare Pages Functions）的普通 HTTPS 请求，
-// 按请求里给的代理（每账号一个）去访问目标（chatgpt.com），响应流式回传。
-// 为什么需要它：Cloudflare Workers 的 fetch 不能走代理、套接字 startTls
-// 的应用数据通道在生产运行时不可用；本服务跑在正常 Node 环境出网，无此限制。
-// 出网实现（v1.3.6）：默认 impit（Rust 内核，模拟 Chrome 151 的 TLS/JA3 与
-// HTTP/2 指纹）——上游边缘按传输层指纹拦截普通 HTTP 客户端，undici 的指纹
-// 不像浏览器会被 502/403。环境变量 RELAY_FETCH_MODE=undici 可切回 undici；
-// impit 加载失败（原生二进制不可用等）自动回退 undici，实际生效模式见
-// /stats 的 mode 字段，绝不让中转整体挂掉。
-// 鉴权：请求头 x-relay-key 必须与环境变量 RELAY_KEY 一致。
+// Authenticated proxy egress relay (single-file Node service).
+// Accepts HTTPS requests from a backend, fetches the target through the
+// per-request proxy supplied by the caller, and streams the response back.
+// It exists because some edge runtimes cannot route fetch through a proxy
+// or sustain this kind of socket usage; a plain Node process has no such
+// limits.
+// Egress: impit by default (Rust core, Chrome-class TLS/JA3 and HTTP/2
+// fingerprint) - upstream edges filter plain HTTP clients by transport
+// fingerprint. Set RELAY_FETCH_MODE=undici to use undici instead. If the
+// impit native binary fails to load, the service falls back automatically
+// and never refuses to start over it; /stats reports the effective mode.
+// Auth: the x-relay-key header must match the RELAY_KEY env variable.
 const http = require("http");
 const { fetch, ProxyAgent } = require("undici");
 
 const KEY = process.env.RELAY_KEY || "";
 const PORT = Number(process.env.SERVER_PORT || process.env.PORT || 10000);
-// 绑定地址：alwaysdata 的 Node 站点由平台分配 IP:端口，部署时在面板核对
-// 分配到的地址后用环境变量 HOST/PORT 传入（见《搬家说明.md》）；本地与
-// Render 上不设则默认 0.0.0.0，与原行为一致。
+// Bind address: some hosts assign the listen IP and port; pass them in
+// via the HOST and SERVER_PORT/PORT env variables. Defaults to 0.0.0.0.
 const HOST = process.env.HOST || "0.0.0.0";
 
 // ---- 出网实现选择 ----
@@ -36,7 +36,7 @@ const FETCH_MODE = Impit ? "impit" : "undici";
 console.log("relay fetch mode:", FETCH_MODE, FETCH_MODE === REQUESTED_MODE ? "" : `(requested ${REQUESTED_MODE})`);
 
 // impit 的代理是实例级配置（proxyUrl，无逐请求覆盖），按 proxy 缓存实例
-// 复用其连接池；直连用空串键。实例数随号池规模走，超上限整体清空重建。
+// 复用其连接池；直连用空串键。实例数随代理数量走，超上限整体清空重建。
 const impitClients = new Map();
 function impitClient(proxy) {
   const key = proxy || "";
@@ -96,17 +96,19 @@ function collectHeaders(upstream) {
   return out;
 }
 
-// 流量计数（v1.3.2）：/fetch 按 proxy 累计——up = 请求正文字节，down = 响应
-// 正文字节（流式回传时逐块计数，不缓冲整包；只算应用层正文，不含协议头）。
-// proxy 键用掩码形式，掩码规则与后端 _lib.maskProxy 严格对齐（用户名前 4
-// 字符 + "***@" + host[:port]），/stats 永不出完整凭据。不带 proxy 的请求不计。
+// Traffic counters: /fetch accumulates per proxy - up = request body
+// bytes, down = response body bytes (counted chunk by chunk while
+// streaming, bodies are never buffered whole; application-layer bytes
+// only, no protocol headers). Proxy keys are masked (first 4 chars of
+// the username + "***@" + host[:port]); /stats never exposes full
+// credentials. Requests without a proxy are not counted.
 // startedAt = 本进程启动时刻：后端收割时用它判断中转是否重启过（计数清零）。
 const startedAt = Date.now();
 const proxyStats = new Map();
-// 全量请求计数（v1.4.10，后台「中转状态」面板用）：所有通过鉴权的
-// /fetch 都计（含不带 proxy 的直连请求——perProxy 只统计带代理的流量，
-// 面板要的是中转本身活没活、忙不忙）。随进程重启清零，与 startedAt
-// 一起判断是不是同一次运行。
+// Total request counter for the status endpoint: every authenticated
+// /fetch counts (including direct requests without a proxy - perProxy
+// only tracks proxied traffic). Resets on process restart; together
+// with startedAt it identifies one continuous run.
 let totalRequests = 0;
 let lastRequestAt = 0;
 
